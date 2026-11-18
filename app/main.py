@@ -1,8 +1,10 @@
-"""FastAPI 后端：推测解码 vs 无缓存贪心基线的对照服务。"""
+"""FastAPI 后端：推测解码 vs 无缓存贪心基线的对照服务，
+以及受限续写（禁用片段规避 + 指定尾句收尾）验证服务。"""
 
 from __future__ import annotations
 
 import os
+import threading
 from dataclasses import asdict
 
 from fastapi import FastAPI
@@ -11,12 +13,17 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import tokenizer
+from .constrained import constrained_generate, validate_inputs
 from .decoding import compare
 from .model import get_models
 
 app = FastAPI(title="Speculative Decoding Verifier")
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "..", "static")
+
+# 模型为进程内单例且两条解码路径都会改写 KV 缓存/前向计数，
+# 用进程级锁串行化所有推理请求，避免并发请求互相污染缓存状态。
+_MODEL_LOCK = threading.Lock()
 
 # 候选提示词（纯 ASCII，固定词表全部可编码）；启动时扫描出
 # 分别触发"拒绝"和"整块接受"的两条预设。
@@ -55,6 +62,16 @@ class DecodeRequest(BaseModel):
     prompt: str = Field(default="", max_length=200)
     k: int = Field(default=3, ge=1, le=4)
     max_new: int = Field(default=32, ge=1, le=32)
+
+
+class ConstrainedRequest(BaseModel):
+    # 语义校验（长度区间、可打印 ASCII、重复、前置无解等）在
+    # constrained.validate_inputs 内完成并返回 400 + 中文原因；
+    # Pydantic 只做最外层形状兜底。
+    prompt: str = Field(default="", max_length=64)
+    forbidden: list[str] = Field(default_factory=list, max_length=3)
+    tail: str = Field(default="", max_length=8)
+    max_new: int = Field(default=12, ge=1, le=64)
 
 
 def _token_view(ids: list[int]) -> list[dict]:
@@ -115,8 +132,52 @@ def decode(req: DecodeRequest) -> JSONResponse:
             content={"error": "提示词编码后为空，请输入可打印 ASCII 字符。"},
         )
     draft, target = get_models()
-    result = compare(draft, target, prompt_ids, req.k, req.max_new)
+    with _MODEL_LOCK:
+        result = compare(draft, target, prompt_ids, req.k, req.max_new)
     return JSONResponse(_serialize(result, req.prompt))
+
+
+def _constrained_token_view(ids: list[int]) -> list[dict]:
+    return [{"id": int(t), "text": tokenizer.render_token(int(t))} for t in ids]
+
+
+def _serialize_constrained(res) -> dict:
+    return {
+        "status": res.status,
+        "reason": res.reason,
+        "prompt": res.prompt,
+        "prompt_ids": res.prompt_ids,
+        "forbidden": res.forbidden,
+        "tail": res.tail,
+        "max_new": res.max_new,
+        "generated_text": res.generated_text,
+        "joined_text": res.prompt + res.generated_text,
+        "new_tokens": _constrained_token_view(res.new_tokens),
+        "steps": [asdict(s) | {
+            "chosen_view": _constrained_token_view([s.chosen_id])[0],
+            "legal_view": _constrained_token_view(s.legal_ids),
+            "immediate_view": _constrained_token_view(s.rejected_immediate),
+            "dead_end_view": _constrained_token_view(s.rejected_dead_end),
+        } for s in res.steps],
+        "target_forward_count_main": res.target_forward_count_main,
+        "target_forward_count_reference": res.target_forward_count_reference,
+        "feasibility_calls": res.feasibility_calls,
+        "mismatch_index": res.mismatch_index,
+        "final_check": res.final_check,
+    }
+
+
+@app.post("/api/constrained")
+def constrained(req: ConstrainedRequest) -> JSONResponse:
+    # 输入语义校验失败 → 400；no_solution / verify_failed 是正常业务结果 → 200
+    verr = validate_inputs(req.prompt, req.forbidden, req.tail, req.max_new)
+    if verr is not None:
+        return JSONResponse(status_code=400, content={"error": verr})
+    _draft, target = get_models()
+    with _MODEL_LOCK:
+        res = constrained_generate(
+            target, req.prompt, req.forbidden, req.tail, req.max_new)
+    return JSONResponse(_serialize_constrained(res))
 
 
 @app.get("/api/presets")
@@ -128,6 +189,11 @@ def presets() -> dict:
 @app.get("/")
 def index() -> FileResponse:
     return FileResponse(os.path.join(STATIC_DIR, "index.html"))
+
+
+@app.get("/constrained")
+def constrained_page() -> FileResponse:
+    return FileResponse(os.path.join(STATIC_DIR, "constrained.html"))
 
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
